@@ -830,15 +830,31 @@ SHAMap::verifyProofPath(uint256 const& rootHash, uint256 const& key, std::vector
             if (node->getHash() != hash)
                 return false;
 
-            auto const depth = std::distance(path.rbegin(), rit);
+            auto const depth = static_cast<unsigned int>(std::distance(path.rbegin(), rit));
             if (node->isInner())
             {
-                auto nodeId = SHAMapNodeID::createID(static_cast<unsigned int>(depth), key);
+                // Nibbles run out at kLeafDepth, so a node there has no branch left to select and
+                // can only be the leaf that terminates the path. These nodes come off the wire, so
+                // a peer can still claim an inner one: reject it rather than let selectBranch index
+                // past the end of the 32-byte key.
+                SOMETIMES(
+                    depth >= kLeafDepth, "xrpl::SHAMap::verifyProofPath : inner at leaf depth");
+                if (depth >= kLeafDepth)
+                    return false;
+
+                auto nodeId = SHAMapNodeID::createID(depth, key);
                 hash = safeDowncast<SHAMapInnerNode*>(node.get())
                            ->getChildHash(selectBranch(nodeId, key));
             }
             else
             {
+                // The hash chain up to rootHash only proves this leaf sits where the path claims,
+                // not that it is the leaf for `key`: a peer could substitute any other leaf whose
+                // subtree hashes to the same value at every level above it. Checking the terminal
+                // leaf's own key is what ties the proof to `key` specifically.
+                if (leafKey(*node) != key)
+                    return false;
+
                 // should exhaust all the blobs now
                 return depth + 1 == path.size();
             }
