@@ -7,6 +7,7 @@
 #include <xrpl/beast/utility/instrumentation.h>
 #include <xrpl/ledger/ReadView.h>
 #include <xrpl/ledger/helpers/AccountRootHelpers.h>
+#include <xrpl/ledger/helpers/LendingHelpers.h>
 #include <xrpl/ledger/helpers/MPTokenHelpers.h>
 #include <xrpl/protocol/AccountID.h>
 #include <xrpl/protocol/Feature.h>
@@ -839,6 +840,13 @@ ValidMPTTransfer::finalize(
     if (hasPrivilege(tx, OverrideFreeze))
         return true;
 
+    // XLS-0066: a broker must be able to default an already-late loan
+    // regardless of the vault asset's lock state. Gated behind
+    // fixCleanup3_4_0, and scoped below to exactly the broker/vault
+    // pseudo-accounts involved -- see FreezeInvariant.cpp's
+    // TransfersNotFrozen::finalize for the IOU-side equivalent and rationale.
+    auto const loanDefaultAccounts = loanDefaultFreezeExemptAccounts(view, tx);
+
     // DEX transactions (AMM[Create,Deposit], cross-currency payments, offer creates) are
     // subject to the MPTCanTrade flag in addition to the standard transfer rules.
     // A payment is only DEX if it is a cross-currency payment.
@@ -898,8 +906,15 @@ ValidMPTTransfer::finalize(
 
                 // Check once: if any involved account is frozen, the whole issuance transfer is
                 // considered frozen. Only need to check for frozen if there is a transfer of funds.
+                //
+                // The LoanManage default exemption only waives the frozen check, and only for
+                // the specific broker/vault pseudo-accounts identified above -- authorization is
+                // still enforced for them, and both checks still apply to every other account.
+                bool const exemptFromFreeze = loanDefaultAccounts &&
+                    (account == loanDefaultAccounts->broker ||
+                     account == loanDefaultAccounts->vault);
                 if (!invalidTransfer &&
-                    (isFrozen(view, account, MPTIssue{mptID}) ||
+                    ((!exemptFromFreeze && isFrozen(view, account, MPTIssue{mptID})) ||
                      !isAuthorized(view, mptID, account, reqAuth)))
                 {
                     invalidTransfer = true;

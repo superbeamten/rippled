@@ -7,6 +7,7 @@
 #include <xrpl/beast/utility/instrumentation.h>
 #include <xrpl/ledger/ApplyView.h>
 #include <xrpl/ledger/ReadView.h>
+#include <xrpl/protocol/AccountID.h>
 #include <xrpl/protocol/Asset.h>
 #include <xrpl/protocol/LedgerFormats.h>  // IWYU pragma: keep
 #include <xrpl/protocol/Protocol.h>
@@ -21,6 +22,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string_view>
 #include <utility>
 
@@ -57,6 +59,34 @@ canApplyToBrokerCover(
 // Lending protocol has dependencies, so capture them here.
 bool
 checkLendingProtocolDependencies(Rules const& rules, STTx const& tx);
+
+/**
+ * Identifies the accounts whose balance changes LoanManage::defaultLoan's
+ * fixCleanup3_4_0 freeze/lock exemption applies to.
+ *
+ * `defaultLoan` moves funds from the LoanBroker pseudo-account to the Vault
+ * pseudo-account via `accountSend`. Since neither is the vault asset's
+ * issuer, this is a third-party transfer that transits through the issuer in
+ * two hops (broker -> issuer, issuer -> vault; see
+ * `directSendNoLimitIOU`/`directSendNoLimitMPT`), so the exemption must cover
+ * both the issuer/broker and issuer/vault pairs, not a direct broker/vault
+ * pair.
+ *
+ * Returns std::nullopt unless `tx` is a `ttLOAN_MANAGE` transaction with the
+ * `tfLoanDefault` flag set, `fixCleanup3_4_0` is enabled, and the loan/broker/
+ * vault objects it references can all be resolved. Callers use this to scope
+ * the exemption to exactly the accounts `defaultLoan` moves funds between,
+ * rather than to the whole transaction.
+ */
+struct LoanDefaultFreezeExemptAccounts
+{
+    AccountID issuer;
+    AccountID broker;
+    AccountID vault;
+};
+
+[[nodiscard]] std::optional<LoanDefaultFreezeExemptAccounts>
+loanDefaultFreezeExemptAccounts(ReadView const& view, STTx const& tx);
 
 static constexpr std::uint32_t kSecondsInYear = 365 * 24 * 60 * 60;
 
