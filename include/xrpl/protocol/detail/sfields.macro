@@ -236,6 +236,11 @@ TYPED_SFIELD(sfPrincipalRequested,       NUMBER,     14)
 TYPED_SFIELD(sfTotalValueOutstanding,    NUMBER,     15, SField::kSmdNeedsAsset | SField::kSmdDefault)
 TYPED_SFIELD(sfPeriodicPayment,          NUMBER,     16)
 TYPED_SFIELD(sfManagementFeeOutstanding, NUMBER,     17, SField::kSmdNeedsAsset | SField::kSmdDefault)
+// sfDust is deliberately WITHOUT kSmdNeedsAsset: that flag rounds the field
+// to the asset's representable precision via associateAsset(), which is the
+// opposite of this field's purpose (it exists to hold value finer than that
+// precision). See docs/plan-vault-dust-b-prime-field-accounting-kept.md §4.
+TYPED_SFIELD(sfDust,                     NUMBER,     18, SField::kSmdDefault)
 
 // int32
 TYPED_SFIELD(sfLoanScale,                INT32,      1)
