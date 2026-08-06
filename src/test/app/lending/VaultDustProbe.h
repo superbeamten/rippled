@@ -27,7 +27,14 @@
 #include <test/jtx/Env.h>
 
 #include <xrpl/basics/Number.h>
+#include <xrpl/beast/utility/Zero.h>
+#include <xrpl/ledger/View.h>
+#include <xrpl/protocol/Asset.h>
+#include <xrpl/protocol/Indexes.h>
+#include <xrpl/protocol/Issue.h>
 #include <xrpl/protocol/Keylet.h>
+#include <xrpl/protocol/SField.h>
+#include <xrpl/protocol/STLedgerEntry.h>
 
 namespace xrpl::test {
 
@@ -46,9 +53,27 @@ namespace xrpl::test {
 [[nodiscard]] inline Number
 readVaultDust(jtx::Env const& env, Keylet const& vaultKeylet)
 {
-    (void)env;
-    (void)vaultKeylet;
-    return Number{};
+    auto const vaultSle = env.le(vaultKeylet);
+    if (!vaultSle)
+        return Number{};
+
+    xrpl::Asset const asset = vaultSle->at(sfAsset);
+    if (asset.integral())
+        return Number{};
+
+    auto const vaultAccount = vaultSle->at(sfAccount);
+    auto const line =
+        env.current()->read(xrpl::keylet::trustLine(vaultAccount, asset.get<xrpl::Issue>()));
+    if (!line)
+        return Number{};
+
+    // sfDust follows sfBalance's own low/high sign convention: positive
+    // means the low account holds the high account's IOUs. Undo it here so
+    // the shared suite never has to think about which endpoint of the line
+    // is low — see plan-vault-dust-b-prime-field-accounting-kept.md §4.
+    bool const vaultIsHigh = vaultAccount > asset.getIssuer();
+    Number const dust = line->at(sfDust);
+    return vaultIsHigh ? -dust : dust;
 }
 
 }  // namespace xrpl::test
