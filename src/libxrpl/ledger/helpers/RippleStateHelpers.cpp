@@ -22,6 +22,7 @@
 #include <xrpl/protocol/SField.h>
 #include <xrpl/protocol/STAmount.h>
 #include <xrpl/protocol/STLedgerEntry.h>
+#include <xrpl/protocol/STNumber.h>  // IWYU pragma: keep
 #include <xrpl/protocol/TER.h>
 #include <xrpl/protocol/UintTypes.h>
 #include <xrpl/protocol/XRPAmount.h>
@@ -730,6 +731,12 @@ removeEmptyHolding(
     if (!line)
         return accountIsIssuer ? (TER)tesSUCCESS : (TER)tecOBJECT_NOT_FOUND;
     if (!accountIsIssuer && line->at(sfBalance)->iou() != beast::kZero)
+        return tecHAS_OBLIGATIONS;
+    // A line can be balance-zero yet still hold non-zero sfDust (plan §5.3
+    // hazard 1: a debit can legally consume all representable balance and
+    // leave only dust). Refuse to delete it — dust is invisible to
+    // accountHolds, so deleting the line would silently destroy that value.
+    if (!accountIsIssuer && Number{line->at(sfDust)} != beast::kZero)
         return tecHAS_OBLIGATIONS;
 
     // Adjust the owner count(s)

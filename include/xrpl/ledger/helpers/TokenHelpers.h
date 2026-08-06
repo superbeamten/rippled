@@ -60,6 +60,33 @@ enum class AllowMPTOverflow : bool { No = false, Yes };
  */
 enum class WaiveMPTCanTransfer : bool { No = false, Yes };
 
+/**
+ * A caller that maintains its own cached total of a trust line's balance can
+ * ask the credit path to keep sfBalance representable at a scale of the
+ * caller's choosing, parking the remainder in sfDust, and to report what
+ * actually moved. Passing one of these IS the opt-in; the credit path's
+ * default is nullptr, which reproduces today's behaviour exactly.
+ *
+ * All fields below are RECEIVER-POSITIVE: positive means the receiver's
+ * holdings grew. See docs/plan-vault-dust-b-prime-field-accounting-kept.md
+ * §5.2 for the full rationale, including why targetScale has no default.
+ */
+struct DustSplit
+{
+    explicit DustSplit(int targetScale) : targetScale(targetScale)
+    {
+    }
+
+    // --- in ---
+    int targetScale;  // exponent sfBalance must remain representable at
+
+    // --- out ---
+    Number balanceDelta{};  // how much sfBalance moved
+    Number dustDelta{};     // how much sfDust moved. SIGNED: negative means
+                            // previously-deferred dust was promoted into
+                            // sfBalance by this operation.
+};
+
 /* Check if MPToken (for MPT) or trust line (for IOU) exists:
  * - StrongAuth - before checking if authorization is required
  * - WeakAuth
@@ -386,7 +413,8 @@ accountSend(
     beast::Journal j,
     SLE::ref sponsorSle = {},
     WaiveTransferFee waiveFee = WaiveTransferFee::No,
-    AllowMPTOverflow allowOverflow = AllowMPTOverflow::No);
+    AllowMPTOverflow allowOverflow = AllowMPTOverflow::No,
+    DustSplit* dust = nullptr);
 
 using MultiplePaymentDestinations = std::vector<std::pair<AccountID, Number>>;
 /**

@@ -24,6 +24,7 @@
 #include <xrpl/protocol/SField.h>
 #include <xrpl/protocol/STAmount.h>
 #include <xrpl/protocol/STLedgerEntry.h>
+#include <xrpl/protocol/STNumber.h>  // IWYU pragma: keep
 #include <xrpl/protocol/TER.h>
 #include <xrpl/protocol/UintTypes.h>
 #include <xrpl/protocol/XRPAmount.h>
@@ -647,7 +648,8 @@ directSendNoFeeIOU(
     STAmount const& saAmount,
     bool bCheckIssuer,
     SLE::ref sponsorSle,
-    beast::Journal j)
+    beast::Journal j,
+    DustSplit* dust = nullptr)
 {
     AccountID const& issuer = saAmount.getIssuer();
     Currency const& currency = saAmount.get<Issue>().currency;
@@ -683,7 +685,66 @@ directSendNoFeeIOU(
 
         STAmount const saBefore = saBalance;
 
-        saBalance -= saAmount;
+        // dustLedgerAfter holds the value that must be written to sfDust once
+        // the branch below decides bDelete, in the LINE'S OWN sign
+        // convention (i.e. not yet negated back to sender terms). Left
+        // unset (nullopt) when this call must not touch sfDust at all —
+        // which is every existing caller (dust == nullptr) — so a line that
+        // never carries dust is byte-identical to before.
+        std::optional<Number> dustLedgerAfter;
+
+        if (dust)
+        {
+            // Plan §5.3: sfBalance and sfDust are one signed extended
+            // quantity, in SENDER terms (i.e. after the negation above).
+            Number const lineDustSender = bSenderHigh ? -Number{sleRippleState->at(sfDust)}
+                                                      : Number{sleRippleState->at(sfDust)};
+
+            Number const exactBefore = Number{saBefore} + lineDustSender;
+            Number const exactAfter = exactBefore - Number{saAmount};
+
+            // Truncate the SUM toward zero at the caller's target scale —
+            // never round the increment and subtract. This is what makes
+            // promotion of previously-deferred dust automatic (maths doc
+            // §6.1): if lineDustSender plus saAmount together clear a whole
+            // quantum, that quantum lands in newBalance with no separate
+            // fold step.
+            Number const newBalance = roundToAsset(
+                saAmount.asset(), exactAfter, dust->targetScale, Number::RoundingMode::TowardsZero);
+            Number const newDust = exactAfter - newBalance;
+
+            XRPL_ASSERT(
+                newDust == beast::kZero || abs(newDust) < Number(1, dust->targetScale),
+                "xrpl::directSendNoFeeIOU : dust remainder bounded by one quantum");
+            XRPL_ASSERT(
+                newDust == beast::kZero || exactAfter == beast::kZero ||
+                    (newDust < beast::kZero) == (exactAfter < beast::kZero),
+                "xrpl::directSendNoFeeIOU : dust does not change sign of the extended quantity");
+
+            Number const balanceDeltaSender = newBalance - Number{saBefore};
+            Number const dustDeltaSender = newDust - lineDustSender;
+
+            XRPL_ASSERT(
+                balanceDeltaSender + dustDeltaSender == -Number{saAmount},
+                "xrpl::directSendNoFeeIOU : balance and dust deltas add up to the credit");
+
+            // Report back RECEIVER-POSITIVE (plan §5.2): the receiver's gain
+            // is the sender's loss.
+            dust->balanceDelta = -balanceDeltaSender;
+            dust->dustDelta = -dustDeltaSender;
+
+            // newBalance is already in SENDER terms (built from saBefore,
+            // which was put there by the negation above); the existing
+            // negate-back-to-ledger-terms code below applies to it exactly
+            // as it would to the non-dust subtraction result.
+            saBalance = STAmount{saAmount.asset(), newBalance};
+
+            dustLedgerAfter = bSenderHigh ? -newDust : newDust;
+        }
+        else
+        {
+            saBalance -= saAmount;
+        }
 
         JLOG(j.trace()) << "directSendNoFeeIOU: " << to_string(uSenderID) << " -> "
                         << to_string(uReceiverID) << " : before=" << saBefore.getFullText()
@@ -733,12 +794,24 @@ directSendNoFeeIOU(
             // Receiver reserve is clear.
         }
 
+        // Never delete a line with non-zero sfDust (plan §5.3 hazard 4): a
+        // deleted RIPPLE_STATE silently destroys whatever sfDust still held.
+        // This guard applies even on the dust == nullptr path, because the
+        // line may carry dust left behind by an earlier dust-aware credit.
+        Number const dustAtDeleteCheck =
+            dustLedgerAfter ? *dustLedgerAfter : Number{sleRippleState->at(sfDust)};
+        if (dustAtDeleteCheck != beast::kZero)
+            bDelete = false;
+
         if (bSenderHigh)
             saBalance.negate();
 
         // Want to reflect balance to zero even if we are deleting line.
         sleRippleState->setFieldAmount(sfBalance, saBalance);
         // ONLY: Adjust balance.
+
+        if (dustLedgerAfter)
+            sleRippleState->at(sfDust) = *dustLedgerAfter;
 
         if (bDelete)
         {
@@ -752,6 +825,21 @@ directSendNoFeeIOU(
 
         view.update(sleRippleState);
         return tesSUCCESS;
+    }
+
+    // A DustSplit implies the line already exists — the Vault's custody
+    // line is created by VaultCreate's addEmptyHolding before any
+    // dust-aware credit can reach it (plan §5.3). Treat reaching here with
+    // a split requested as a caller error for this plan: assert in debug,
+    // and in release report an all-balance no-split so nothing is silently
+    // dropped.
+    XRPL_ASSERT(!dust, "xrpl::directSendNoFeeIOU : dust split requires an existing trust line");
+    if (dust)
+    {
+        // LCOV_EXCL_START
+        dust->balanceDelta = Number{saAmount};
+        dust->dustDelta = Number{0};
+        // LCOV_EXCL_STOP
     }
 
     STAmount const saReceiverLimit(Issue{currency, uReceiverID});
@@ -801,7 +889,8 @@ directSendNoLimitIOU(
     STAmount& saActual,
     beast::Journal j,
     SLE::ref sponsorSle,
-    WaiveTransferFee waiveFee)
+    WaiveTransferFee waiveFee,
+    DustSplit* dust = nullptr)
 {
     auto const& issuer = saAmount.getIssuer();
 
@@ -814,7 +903,7 @@ directSendNoLimitIOU(
     {
         // Direct send: redeeming IOUs and/or sending own IOUs.
         auto const ter =
-            directSendNoFeeIOU(view, uSenderID, uReceiverID, saAmount, false, sponsorSle, j);
+            directSendNoFeeIOU(view, uSenderID, uReceiverID, saAmount, false, sponsorSle, j, dust);
         if (!isTesSuccess(ter))
             return ter;
         saActual = saAmount;
@@ -832,11 +921,18 @@ directSendNoLimitIOU(
                     << to_string(uReceiverID) << " : deliver=" << saAmount.getFullText()
                     << " cost=" << saActual.getFullText();
 
-    TER terResult = directSendNoFeeIOU(view, issuer, uReceiverID, saAmount, true, sponsorSle, j);
+    // The dust split, if requested, applies ONLY to the receiver-side credit
+    // (this call). The sender-side debit below always gets nullptr: forwarding
+    // the same pointer to both would truncate the SENDER's line at the
+    // receiver's target scale and would overwrite the receiver-side deltas
+    // with the sender-side ones (plan §5.2).
+    TER terResult =
+        directSendNoFeeIOU(view, issuer, uReceiverID, saAmount, true, sponsorSle, j, dust);
 
     if (tesSUCCESS == terResult)
     {
-        terResult = directSendNoFeeIOU(view, uSenderID, issuer, saActual, true, sponsorSle, j);
+        terResult =
+            directSendNoFeeIOU(view, uSenderID, issuer, saActual, true, sponsorSle, j, nullptr);
     }
 
     return terResult;
@@ -927,7 +1023,8 @@ accountSendIOU(
     STAmount const& saAmount,
     beast::Journal j,
     SLE::ref sponsorSle,
-    WaiveTransferFee waiveFee)
+    WaiveTransferFee waiveFee,
+    DustSplit* dust = nullptr)
 {
     if (view.rules().enabled(fixAMMv1_1))
     {
@@ -959,8 +1056,10 @@ accountSendIOU(
                         << to_string(uReceiverID) << " : " << saAmount.getFullText();
 
         return directSendNoLimitIOU(
-            view, uSenderID, uReceiverID, saAmount, saActual, j, sponsorSle, waiveFee);
+            view, uSenderID, uReceiverID, saAmount, saActual, j, sponsorSle, waiveFee, dust);
     }
+
+    XRPL_ASSERT(!dust, "xrpl::accountSendIOU : dust split is IOU-only");
 
     /* XRP send which does not check reserve and can do pure adjustment.
      * Note that sender or receiver may be null and this not a mistake; this
@@ -1505,13 +1604,16 @@ accountSend(
     beast::Journal j,
     SLE::ref sponsorSle,
     WaiveTransferFee waiveFee,
-    AllowMPTOverflow allowOverflow)
+    AllowMPTOverflow allowOverflow,
+    DustSplit* dust)
 {
     return saAmount.asset().visit(
         [&](Issue const&) {
-            return accountSendIOU(view, uSenderID, uReceiverID, saAmount, j, sponsorSle, waiveFee);
+            return accountSendIOU(
+                view, uSenderID, uReceiverID, saAmount, j, sponsorSle, waiveFee, dust);
         },
         [&](MPTIssue const&) {
+            XRPL_ASSERT(!dust, "xrpl::accountSend : dust split is IOU-only");
             return accountSendMPT(
                 view, uSenderID, uReceiverID, saAmount, j, waiveFee, allowOverflow);
         });
