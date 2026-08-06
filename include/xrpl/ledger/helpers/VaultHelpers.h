@@ -129,6 +129,45 @@ isSoleShareholder(ReadView const& view, AccountID const& account, SLE::const_ref
 getVaultVersion(SLE::const_ref vault);
 
 /**
+ * Whether this Vault's custody trust line participates in the sfDust
+ * mechanism (docs/plan-vault-dust-b-prime-field-accounting-kept.md §2.2).
+ * True only for a cash-basis Vault (sfLEVersion == VaultVersion::CashBasis)
+ * holding an IOU asset. A Vault that pre-dates the amendment (Legacy) or
+ * that holds an integral asset (XRP/MPT, which never produces sub-quantum
+ * remainders) is excluded, and every dust-aware code path is skipped for
+ * it, unconditionally and forever.
+ *
+ * @param vault The vault SLE.
+ */
+[[nodiscard]] bool
+useVaultDust(SLE::const_ref vault);
+
+/**
+ * Promotes whole quanta of dust stranded on a Vault's custody line back
+ * into sfBalance after a scale-refining removal (VaultWithdraw,
+ * VaultClawback, LoanManage::defaultLoan) — the only situation that can
+ * leave representable value in sfDust with no accompanying credit to
+ * recompute it (every credit already promotes automatically, see
+ * TokenHelpers.h's DustSplit). A no-op when useVaultDust(vault) is false,
+ * when the custody line does not exist, or when sfDust is still below one
+ * quantum.
+ *
+ * Moves both sfAssetsAvailable and sfAssetsTotal by the same amount: this
+ * recognises deferred cash and creates no new receivable, so
+ * AssetsTotal - AssetsAvailable must be unchanged by this call (the same
+ * receivable-invariance law as addAssetsToVault's dust adjustment, with
+ * recognitionDelta == 0).
+ *
+ * @param view The ApplyView to mutate.
+ * @param vault The vault SLE (mutated in place; caller retains ownership).
+ * @param j Journal.
+ *
+ * @return tesSUCCESS always (there is no "still sub-quantum" failure mode).
+ */
+[[nodiscard]] TER
+maybeRenormaliseVaultDust(ApplyView& view, SLE::ref vault, beast::Journal j);
+
+/**
  * The single owner of every write to a Vault's two accounting fields,
  * sfAssetsAvailable and sfAssetsTotal, for a cash-moving-in operation
  * (deposit, repayment, or default settlement).

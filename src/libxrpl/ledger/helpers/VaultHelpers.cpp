@@ -5,8 +5,11 @@
 #include <xrpl/beast/utility/instrumentation.h>
 #include <xrpl/ledger/ApplyView.h>
 #include <xrpl/ledger/ReadView.h>
+#include <xrpl/ledger/helpers/LendingHelpers.h>
 #include <xrpl/protocol/AccountID.h>
+#include <xrpl/protocol/Asset.h>
 #include <xrpl/protocol/Indexes.h>
+#include <xrpl/protocol/Issue.h>
 #include <xrpl/protocol/LedgerFormats.h>  // IWYU pragma: keep
 #include <xrpl/protocol/Protocol.h>
 #include <xrpl/protocol/SField.h>
@@ -159,6 +162,57 @@ getVaultVersion(SLE::const_ref vault)
         // LCOV_EXCL_STOP
     }
     return static_cast<VaultVersion>(version);
+}
+
+[[nodiscard]] bool
+useVaultDust(SLE::const_ref vault)
+{
+    XRPL_ASSERT(vault && vault->getType() == ltVAULT, "xrpl::useVaultDust : valid Vault sle");
+    Asset const asset = vault->at(sfAsset);
+    return getVaultVersion(vault) == VaultVersion::CashBasis && !asset.integral();
+}
+
+[[nodiscard]] TER
+maybeRenormaliseVaultDust(ApplyView& view, SLE::ref vault, beast::Journal j)
+{
+    (void)j;
+    XRPL_ASSERT(
+        vault && vault->getType() == ltVAULT, "xrpl::maybeRenormaliseVaultDust : valid Vault sle");
+
+    if (!useVaultDust(vault))
+        return tesSUCCESS;
+
+    Asset const asset = vault->at(sfAsset);
+    AccountID const vaultAccount = vault->at(sfAccount);
+    auto const line = view.peek(keylet::trustLine(vaultAccount, asset.get<Issue>()));
+    if (!line || Number{line->at(sfDust)} == beast::kZero)
+        return tesSUCCESS;
+
+    bool const vaultIsHigh = vaultAccount > asset.getIssuer();
+    // Normalize sfDust to Vault-pseudo terms, the same convention
+    // directSendNoFeeIOU uses internally for the trust line's sender.
+    Number const dustInVaultTerms =
+        vaultIsHigh ? -Number{line->at(sfDust)} : Number{line->at(sfDust)};
+
+    // Read the scale BEFORE any write below (§7's ordering constraint).
+    std::int32_t const vaultScale = getAssetsTotalScale(vault);
+    Number const movable =
+        roundToAsset(asset, dustInVaultTerms, vaultScale, Number::RoundingMode::Downward);
+    if (movable == beast::kZero)
+        return tesSUCCESS;  // still sub-quantum
+
+    Number const movableInLineTerms = vaultIsHigh ? -movable : movable;
+    STAmount const newBalance =
+        line->getFieldAmount(sfBalance) + STAmount{asset, movableInLineTerms};
+    line->setFieldAmount(sfBalance, newBalance);
+    line->at(sfDust) = Number{line->at(sfDust)} - movableInLineTerms;
+    view.update(line);
+
+    vault->at(sfAssetsAvailable) += movable;
+    vault->at(sfAssetsTotal) += movable;
+    view.update(vault);
+
+    return tesSUCCESS;
 }
 
 [[nodiscard]] std::expected<Number, TER>
