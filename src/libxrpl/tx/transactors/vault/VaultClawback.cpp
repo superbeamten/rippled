@@ -449,6 +449,12 @@ VaultClawback::doApply()
 
     associateAsset(*vault, vaultAsset);
 
+    // A clawback shrinks AssetsTotal, which refines the Vault's scale
+    // (common §2.1). Promote any dust that is now representable at the new,
+    // finer scale — nothing else will, since no credit touched the line.
+    if (auto const ter = maybeRenormaliseVaultDust(view(), vault, j_))
+        return ter;  // LCOV_EXCL_LINE
+
     return tesSUCCESS;
 }
 

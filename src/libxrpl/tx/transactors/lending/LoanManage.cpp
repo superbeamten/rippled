@@ -279,14 +279,25 @@ LoanManage::defaultLoan(
 
     // Return funds from the LoanBroker pseudo-account to the
     // Vault pseudo-account:
-    return accountSend(
-        view,
-        brokerSle->at(sfAccount),
-        vaultSle->at(sfAccount),
-        STAmount{vaultAsset, defaultCovered},
-        j,
-        {},
-        WaiveTransferFee::Yes);
+    if (auto const ter = accountSend(
+            view,
+            brokerSle->at(sfAccount),
+            vaultSle->at(sfAccount),
+            STAmount{vaultAsset, defaultCovered},
+            j,
+            {},
+            WaiveTransferFee::Yes))
+        return ter;
+
+    // The default shrinks AssetsTotal (vaultDefaultRounded above), which
+    // refines the Vault's scale (common §2.1). Promote any dust that is now
+    // representable at the new, finer scale — nothing else will, since this
+    // path does not route defaultCovered through the dust-aware credit
+    // split (common §2.2: this plan characterized the pre-existing
+    // AssetsAvailable/AssetsTotal drift here and found the existing
+    // :196-212 workaround already keeps the shared suite green without a
+    // DustSplit at this site; see the PR description).
+    return maybeRenormaliseVaultDust(view, vaultSle, j);
 }
 
 TER

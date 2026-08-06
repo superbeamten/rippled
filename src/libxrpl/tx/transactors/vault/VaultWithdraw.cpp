@@ -338,6 +338,34 @@ VaultWithdraw::doApply()
         }
         assetsWithdrawn = allAvailable;
 
+        // This is the terminal case: fold ALL of sfDust (not just whole
+        // quanta — there is no other shareholder left to divide it with)
+        // into sfBalance and pay it out along with everything else, so
+        // sfDust ends up exactly zero (plan §10.1), which is what lets the
+        // bDelete / VaultDelete guards (plan §5.3 hazard 4, §9) permit
+        // cleanup afterwards.
+        if (useVaultDust(vault))
+        {
+            AccountID const vaultAccount = vault->at(sfAccount);
+            if (auto const line =
+                    view().peek(keylet::trustLine(vaultAccount, vaultAsset.get<Issue>())))
+            {
+                bool const vaultIsHigh = vaultAccount > vaultAsset.getIssuer();
+                Number const dustInVaultTerms =
+                    vaultIsHigh ? -Number{line->at(sfDust)} : Number{line->at(sfDust)};
+                if (dustInVaultTerms != beast::kZero)
+                {
+                    STAmount const newBalance = line->getFieldAmount(sfBalance) +
+                        STAmount{vaultAsset, vaultIsHigh ? -dustInVaultTerms : dustInVaultTerms};
+                    line->setFieldAmount(sfBalance, newBalance);
+                    line->at(sfDust) = Number{0};
+                    view().update(line);
+
+                    assetsWithdrawn += STAmount{vaultAsset, dustInVaultTerms};
+                }
+            }
+        }
+
         // Do not let dust accumulate in the Vault.
         if (auto const result = closeVaultAssets(view(), vault, j_); !result)
             return result.error();  // LCOV_EXCL_LINE
@@ -348,6 +376,13 @@ VaultWithdraw::doApply()
                 removeAssetsFromVault(view(), vault, assetsWithdrawn, -assetsWithdrawn, j_);
             !result)
             return result.error();  // LCOV_EXCL_LINE
+
+        // A non-terminal withdrawal shrinks AssetsTotal, which refines the
+        // Vault's scale (common §2.1). Promote any dust that is now
+        // representable at the new, finer scale — nothing else will, since
+        // no credit touched the line.
+        if (auto const ter = maybeRenormaliseVaultDust(view(), vault, j_))
+            return ter;  // LCOV_EXCL_LINE
     }
 
     auto const& vaultAccount = vault->at(sfAccount);
