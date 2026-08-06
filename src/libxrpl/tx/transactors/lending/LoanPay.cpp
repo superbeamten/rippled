@@ -437,13 +437,28 @@ LoanPay::doApply()
     auto assetsTotalProxy = vaultSle->at(sfAssetsTotal);
 
     auto const totalPaidToVaultRaw = paymentParts->principalPaid + paymentParts->interestPaid;
-    auto const totalPaidToVaultRounded =
-        roundToAsset(asset, totalPaidToVaultRaw, vaultScale, Number::RoundingMode::Downward);
+    auto const totalPaidToBroker = paymentParts->feePaid;
+
+    // Dust handling (docs/plan-vault-dust-b-prime-field-accounting-kept.md)
+    // is scoped to cash-basis Vaults holding an IOU asset, and only once the
+    // amendment has activated (common §2.2/§2.5). Everywhere useDust is
+    // false below, every line runs exactly the arithmetic that shipped
+    // before this change.
+    bool const useDust = view.rules().enabled(featureLendingProtocolV1_1) && useVaultDust(vaultSle);
+
+    // Without dust handling, round DOWN to the Vault's scale before the
+    // transfer (today's behaviour, using the ANTERIOR scale verbatim; see
+    // common §4.2a). With it, the credit path itself performs the split
+    // against the POSTERIOR scale (plan §5.2), so the Vault leg below is
+    // sent the raw figure and totalPaidToVaultRounded exists only for
+    // logging/assertions, where it is simply equal to the raw figure.
+    auto const totalPaidToVaultRounded = useDust
+        ? totalPaidToVaultRaw
+        : roundToAsset(asset, totalPaidToVaultRaw, vaultScale, Number::RoundingMode::Downward);
     XRPL_ASSERT_PARTS(
         !asset.integral() || totalPaidToVaultRaw == totalPaidToVaultRounded,
         "xrpl::LoanPay::doApply",
         "rounding does nothing for integral asset");
-    auto const totalPaidToBroker = paymentParts->feePaid;
 
     XRPL_ASSERT_PARTS(
         (totalPaidToVaultRaw + totalPaidToBroker) ==
@@ -486,17 +501,25 @@ LoanPay::doApply()
     }
 #endif
 
-    // NOTE: totalPaidToVaultRounded, not totalPaidToVaultRaw — the switch to
-    // raw belongs to the dust-mechanism amendment, not this refactor.
-    if (auto const result =
-            addAssetsToVault(view, vaultSle, totalPaidToVaultRounded, assetsTotalDelta, j_);
-        !result)
-        return result.error();  // LCOV_EXCL_LINE
+    if (!useDust)
+    {
+        // NOTE: totalPaidToVaultRounded, not totalPaidToVaultRaw. The
+        // dust-mechanism branch below (useDust) uses the raw figure instead,
+        // via the credit path's own split.
+        if (auto const result =
+                addAssetsToVault(view, vaultSle, totalPaidToVaultRounded, assetsTotalDelta, j_);
+            !result)
+            return result.error();  // LCOV_EXCL_LINE
 
-    XRPL_ASSERT_PARTS(
-        *assetsAvailableProxy <= *assetsTotalProxy,
-        "xrpl::LoanPay::doApply",
-        "assets available must not be greater than assets outstanding");
+        XRPL_ASSERT_PARTS(
+            *assetsAvailableProxy <= *assetsTotalProxy,
+            "xrpl::LoanPay::doApply",
+            "assets available must not be greater than assets outstanding");
+    }
+    // useDust: the field update is deferred until after the Vault-leg
+    // transfer below, because the amount actually recognised
+    // (assetsTotalDelta - split.dustDelta) is not known until the credit
+    // path's split has run (plan §6 item 2, "Ordering").
 
     JLOG(j_.debug()) << "total paid to vault raw: " << totalPaidToVaultRaw
                      << ", total paid to vault rounded: " << totalPaidToVaultRounded
@@ -520,69 +543,89 @@ LoanPay::doApply()
 
     associateAsset(*loanSle, asset);
     associateAsset(*brokerSle, asset);
-    associateAsset(*vaultSle, asset);
+    // NOTE: *vaultSle*'s associateAsset is deliberately NOT called here.
+    // associateAsset rounds+snaps the field's CURRENT value in place
+    // (STNumber::associateAsset -> roundToAsset), and STNumber::add's debug
+    // assertion then requires the value to still equal that rounded snapshot
+    // at serialization time. Under useDust, sfAssetsTotal/sfAssetsAvailable
+    // are not written until after the transfer below, so associating here
+    // would snapshot a stale value and the later += would violate that
+    // assertion. Call it once, after every mutation to vaultSle is done,
+    // for both branches — see below.
 
-    // Duplicate some checks after rounding
-    Number const assetsAvailableAfter = *assetsAvailableProxy;
-    Number const assetsTotalAfter = *assetsTotalProxy;
+    if (!useDust)
+    {
+        // Duplicate some checks after rounding. Under useDust these
+        // particular checks do not hold in general — a legitimate deferral
+        // can leave AssetsTotal's actual increment smaller than
+        // assetsTotalDelta (even zero or, in principle, momentarily
+        // negative relative to it), and a legitimate pure-deferral
+        // repayment can leave AssetsAvailable unchanged if the whole credit
+        // is parked in sfDust. That is by design (maths doc §4), not the
+        // precision-loss failure these checks exist to catch, so they are
+        // confined to the pre-dust arithmetic. The useDust branch below
+        // asserts its own, narrower invariant instead.
+        Number const assetsAvailableAfter = *assetsAvailableProxy;
+        Number const assetsTotalAfter = *assetsTotalProxy;
 
-    XRPL_ASSERT_PARTS(
-        assetsAvailableAfter <= assetsTotalAfter,
-        "xrpl::LoanPay::doApply",
-        "assets available must not be greater than assets outstanding");
-    if (assetsAvailableAfter == assetsAvailableBefore)
-    {
-        // An unchanged assetsAvailable indicates that the amount paid to the
-        // vault was zero, or rounded to zero. That should be impossible, but I
-        // can't rule it out for extreme edge cases, so fail gracefully if it
-        // happens.
-        //
-        // LCOV_EXCL_START
-        JLOG(j_.warn()) << "LoanPay: Vault assets available unchanged after rounding: "  //
-                        << "Before: " << assetsAvailableBefore                           //
-                        << ", After: " << assetsAvailableAfter;
-        return tecPRECISION_LOSS;
-        // LCOV_EXCL_STOP
-    }
-    if (assetsTotalDelta != beast::kZero && assetsTotalAfter == assetsTotalBefore)
-    {
-        // Non-zero assetsTotalDelta with an unchanged assetsTotal indicates that
-        // the actual value change rounded to zero. That should be impossible, but
-        // I can't rule it out for extreme edge cases, so fail gracefully if it
-        // happens.
-        //
-        // LCOV_EXCL_START
-        JLOG(j_.warn())
-            << "LoanPay: Vault assets expected change, but unchanged after rounding: "  //
-            << "Before: " << assetsTotalBefore                                          //
-            << ", After: " << assetsTotalAfter                                          //
-            << ", AssetsTotalDelta: " << assetsTotalDelta;
-        return tecPRECISION_LOSS;
-        // LCOV_EXCL_STOP
-    }
-    if (assetsTotalDelta == beast::kZero && assetsTotalAfter != assetsTotalBefore)
-    {
-        // A change in assetsTotal when there was no assetsTotalDelta indicates
-        // that something really weird happened. That should be flat out
-        // impossible.
-        //
-        // LCOV_EXCL_START
-        JLOG(j_.fatal()) << "LoanPay: Vault assets changed unexpectedly after rounding: "  //
-                         << "Before: " << assetsTotalBefore                                //
-                         << ", After: " << assetsTotalAfter                                //
-                         << ", AssetsTotalDelta: " << assetsTotalDelta;
-        return tecINTERNAL;
-        // LCOV_EXCL_STOP
-    }
-    if (assetsAvailableAfter > assetsTotalAfter)
-    {
-        // Assets available are not allowed to be larger than assets total.
-        // LCOV_EXCL_START
-        JLOG(j_.fatal()) << "LoanPay: Vault assets available must not be greater "
-                            "than assets outstanding. Available: "
-                         << assetsAvailableAfter << ", Total: " << assetsTotalAfter;
-        return tecINTERNAL;
-        // LCOV_EXCL_STOP
+        XRPL_ASSERT_PARTS(
+            assetsAvailableAfter <= assetsTotalAfter,
+            "xrpl::LoanPay::doApply",
+            "assets available must not be greater than assets outstanding");
+        if (assetsAvailableAfter == assetsAvailableBefore)
+        {
+            // An unchanged assetsAvailable indicates that the amount paid to the
+            // vault was zero, or rounded to zero. That should be impossible, but I
+            // can't rule it out for extreme edge cases, so fail gracefully if it
+            // happens.
+            //
+            // LCOV_EXCL_START
+            JLOG(j_.warn()) << "LoanPay: Vault assets available unchanged after rounding: "  //
+                            << "Before: " << assetsAvailableBefore                           //
+                            << ", After: " << assetsAvailableAfter;
+            return tecPRECISION_LOSS;
+            // LCOV_EXCL_STOP
+        }
+        if (assetsTotalDelta != beast::kZero && assetsTotalAfter == assetsTotalBefore)
+        {
+            // Non-zero assetsTotalDelta with an unchanged assetsTotal indicates that
+            // the actual value change rounded to zero. That should be impossible, but
+            // I can't rule it out for extreme edge cases, so fail gracefully if it
+            // happens.
+            //
+            // LCOV_EXCL_START
+            JLOG(j_.warn())
+                << "LoanPay: Vault assets expected change, but unchanged after rounding: "  //
+                << "Before: " << assetsTotalBefore                                          //
+                << ", After: " << assetsTotalAfter                                          //
+                << ", AssetsTotalDelta: " << assetsTotalDelta;
+            return tecPRECISION_LOSS;
+            // LCOV_EXCL_STOP
+        }
+        if (assetsTotalDelta == beast::kZero && assetsTotalAfter != assetsTotalBefore)
+        {
+            // A change in assetsTotal when there was no assetsTotalDelta indicates
+            // that something really weird happened. That should be flat out
+            // impossible.
+            //
+            // LCOV_EXCL_START
+            JLOG(j_.fatal()) << "LoanPay: Vault assets changed unexpectedly after rounding: "  //
+                             << "Before: " << assetsTotalBefore                                //
+                             << ", After: " << assetsTotalAfter                                //
+                             << ", AssetsTotalDelta: " << assetsTotalDelta;
+            return tecINTERNAL;
+            // LCOV_EXCL_STOP
+        }
+        if (assetsAvailableAfter > assetsTotalAfter)
+        {
+            // Assets available are not allowed to be larger than assets total.
+            // LCOV_EXCL_START
+            JLOG(j_.fatal()) << "LoanPay: Vault assets available must not be greater "
+                                "than assets outstanding. Available: "
+                             << assetsAvailableAfter << ", Total: " << assetsTotalAfter;
+            return tecINTERNAL;
+            // LCOV_EXCL_STOP
+        }
     }
 
     // These three values are used to check that funds are conserved after the transfers
@@ -643,7 +686,63 @@ LoanPay::doApply()
             return ter;
     }
 
-    if (auto const ter = accountSendMulti(
+    if (useDust)
+    {
+        // Vault leg: credit the RAW figure through the dust-aware split
+        // (TokenHelpers.h's DustSplit), targeting the POSTERIOR scale
+        // (common §4.2a) — the scale implied by AssetsTotal after this
+        // operation's own recognition update, an upper bound on the
+        // Vault's increase (maths doc §2).
+        std::int32_t const targetScale = [&]() {
+            NumberRoundModeGuard const rg(Number::RoundingMode::ToNearest);
+            return scale(*assetsTotalProxy + assetsTotalDelta, asset);
+        }();
+        DustSplit split(targetScale);
+        if (auto const ter = accountSend(
+                view,
+                accountID_,
+                vaultPseudoAccount,
+                STAmount{asset, totalPaidToVaultRaw},
+                j_,
+                {},
+                WaiveTransferFee::Yes,
+                AllowMPTOverflow::No,
+                &split))
+            return ter;
+
+        // §6 item 2, the most important paragraph in the plan: BOTH
+        // accounting fields move by the reported dust delta. dustDelta is
+        // SIGNED — negative on a promotion — and the helper's
+        // recognitionDelta parameter applies it symmetrically, which is
+        // what keeps the receivable (AssetsTotal - AssetsAvailable)
+        // identical to what it would be with no dust mechanism at all
+        // (maths doc §6.2).
+        if (auto const result = addAssetsToVault(
+                view, vaultSle, split.balanceDelta, assetsTotalDelta - split.dustDelta, j_);
+            !result)
+            return result.error();  // LCOV_EXCL_LINE
+
+        XRPL_ASSERT_PARTS(
+            *assetsAvailableProxy <= *assetsTotalProxy,
+            "xrpl::LoanPay::doApply",
+            "assets available must not be greater than assets outstanding (dust)");
+
+        // Broker leg: unaffected by dust — a plain transfer, as before.
+        if (totalPaidToBroker != beast::kZero)
+        {
+            if (auto const ter = accountSend(
+                    view,
+                    accountID_,
+                    brokerPayee,
+                    STAmount{asset, totalPaidToBroker},
+                    j_,
+                    {},
+                    WaiveTransferFee::Yes))
+                return ter;
+        }
+    }
+    else if (
+        auto const ter = accountSendMulti(
             view,
             accountID_,
             asset,
@@ -651,6 +750,23 @@ LoanPay::doApply()
             j_,
             WaiveTransferFee::Yes))
         return ter;
+
+    // §6 item 3 (assetsTotalDelta representability): associateAsset's
+    // roundToAsset(asset, value_) snaps the field to STAmount's OWN
+    // 16-significant-digit precision (ToNearest, from the value's own
+    // leading digit) — NOT to any target scale. sfAssetsTotal's Number
+    // holds 19 digits precisely so it CAN carry a sub-quantum recognition
+    // adjustment (common §4.2a rule 4: "never snap onto the coarser
+    // posterior grid"), but calling associateAsset here would silently
+    // erase exactly that adjustment — verified empirically: it reproduces
+    // the pre-fix leak bit-for-bit. So under useDust we deliberately do
+    // NOT associate the asset for vaultSle; STNumber::add's weaker
+    // fallback (used whenever no asset was associated this transaction)
+    // serializes the full-precision value without re-rounding it. This is
+    // the one open point from §6 item 3 this branch does NOT close as a
+    // general rule — see the PR description.
+    if (!useDust)
+        associateAsset(*vaultSle, asset);
 
 #if !NDEBUG
     {
@@ -662,7 +778,7 @@ LoanPay::doApply()
             AuthHandling::IgnoreAuth,
             j_);
         XRPL_ASSERT_PARTS(
-            assetsAvailableAfter == pseudoAccountBalanceAfter,
+            *assetsAvailableProxy == pseudoAccountBalanceAfter,
             "xrpl::LoanPay::doApply",
             "vault pseudo balance agrees after");
     }
