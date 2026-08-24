@@ -459,6 +459,25 @@ TEST_F(SHAMapTraversal, bounds_agree_with_iteration_for_absent_keys)
     }
 }
 
+TEST_F(SHAMapTraversal, update_give_item_on_absent_key_returns_false)
+{
+    tests::TestNodeFamily f{j_};
+    auto keys = deepFanOutKeys();
+    SHAMap map{SHAMapType::FREE, f};
+    fillMap(map, keys);
+
+    // Absent key: walkTowardsKey stops on an inner node with an empty branch, not a leaf.
+    //
+    // This guards the instrumented build, not release. Before the guard in updateGiveItem, an
+    // absent tag reached UNREACHABLE and aborted a Debug or Antithesis build; under NDEBUG that
+    // is a no-op and the `return false` after it ran anyway, so this expectation held there too.
+    auto const absentKey = uint256{std::string_view{std::string(64, '0')}};
+    Buffer vuc{32};
+    std::fill_n(vuc.data(), vuc.size(), std::uint8_t{2});
+    EXPECT_FALSE(map.updateGiveItem(
+        SHAMapNodeType::TnAccountState, makeShamapitem(absentKey, std::move(vuc))));
+}
+
 TEST_F(SHAMapTraversal, bounds_on_empty_map_return_end)
 {
     tests::TestNodeFamily f{j_};

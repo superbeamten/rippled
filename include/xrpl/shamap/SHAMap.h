@@ -491,6 +491,30 @@ private:
         }
 
         /**
+         * Remove and return the node at the end of the path, leaving its ID behind.
+         *
+         * Copying an entry out before popping costs an atomic increment on the node's refcount,
+         * and callers that pop immediately do this per level, so on a 64-level path it is
+         * measurable. Moving the node out avoids that increment. A caller that also wants the ID
+         * reads `top().second` first, which costs the same copy either way: `SHAMapNodeID` derives
+         * from `CountedObject`, which declares no move constructor, so moving one copies it.
+         */
+        [[nodiscard]] SHAMapTreeNodePtr
+        releaseNode()
+        {
+            if (stack_.empty())
+            {
+                // LCOV_EXCL_START
+                UNREACHABLE("xrpl::SHAMap::NodePathStack::releaseNode : empty stack");
+                return {};
+                // LCOV_EXCL_STOP
+            }
+            auto node = std::move(stack_.top().first);
+            stack_.pop();
+            return node;
+        }
+
+        /**
          * Start a path at the root of the map, whose ID is the zero-depth ID by definition.
          *
          * @return false, leaving the path unchanged, if a path was already started. A malformed
@@ -617,6 +641,10 @@ private:
      * Walk towards the specified id, returning the node.  Caller must check
      *  if the return is nullptr, and if not, if the node->peekItem()->key() ==
      * id
+     *
+     * @param stack records the path walked, or nullptr to skip recording it. Lookups that only
+     *              want the leaf (see findKey) omit it to avoid building a path they would
+     *              immediately discard.
      */
     SHAMapLeafNode*
     walkTowardsKey(uint256 const& id, NodePathStack* stack = nullptr) const;
