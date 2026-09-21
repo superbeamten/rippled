@@ -238,6 +238,30 @@ SHAMap::gmnProcessNodes(MissingNodes& mn, MissingNodes::StackEntry& se)
                 if (--mn.max <= 0)
                     return;
             }
+            // The depth is tested first so getChildNodeID is only asked for a child that can exist.
+            // A node already at kLeafDepth has no branch left, and the missing-node case below
+            // reaches that the same way, so this adds no throw of its own.
+            else if (
+                nodeID.getDepth() < kLeafDepth && !belongsAt(nodeID.getChildNodeID(branch), *d))
+            {
+                // The same judgment SHAMap::descend makes, for the path that consults the filter
+                // through descendAsync instead. descendAsync hooks what it resolves, so the node is
+                // already part of the tree and refusing it here would not remove it.
+                //
+                // The verdict belongs to the map for the reason given in SHAMap::descend, which
+                // also records what this does not rest on.
+                //
+                // `fullBelow` is cleared first, as on the missing-node path above. It is a
+                // reference into the caller's stack entry, and this node is left on that stack, so
+                // a later pass over its remaining branches would otherwise reach the full-below
+                // test with it still set and record this subtree's hash as complete in the
+                // family-wide cache, where another map would trust it.
+                JLOG(journal_.warn()) << "Leaf " << childHash << " does not belong below " << nodeID
+                                      << " at branch " << branch << ", map is invalid";
+                fullBelow = false;
+                state_ = SHAMapState::Invalid;
+                return;
+            }
             else if (d->isInner() && !safeDowncast<SHAMapInnerNode*>(d)->isFullBelow(mn.generation))
             {
                 mn.stack.push(se);
@@ -290,6 +314,23 @@ SHAMap::gmnProcessDeferredReads(MissingNodes& mn)
         auto branch = std::get<2>(deferredNode);
         auto nodePtr = std::get<3>(deferredNode);
         auto const& nodeHash = parent->getChildHash(branch);
+
+        if (nodePtr && !belongsAt(parentID.getChildNodeID(branch), *nodePtr))
+        {
+            // The same judgment the two synchronous paths make (see SHAMap::descend and the
+            // descendAsync case in gmnProcessNodes), for a node an async read resolved. Every site
+            // that knows the position a node is about to take judges it here, which is what lets
+            // the traversal treat a misplaced leaf as a rarity rather than a routine case.
+            //
+            // Skips this node rather than returning: the reads still outstanding hold a pointer to
+            // `mn`, which lives in getMissingNodes' frame, and this loop is the only thing that
+            // waits for them. Returning early would let that frame go while a read was still due
+            // to write through it.
+            JLOG(journal_.warn()) << "Leaf " << nodeHash << " does not belong below " << parentID
+                                  << " at branch " << branch << ", map is invalid";
+            state_ = SHAMapState::Invalid;
+            continue;
+        }
 
         if (nodePtr)
         {  // Got the node
@@ -416,7 +457,11 @@ SHAMap::getMissingNodes(int max, SHAMapSyncFilter const* filter)
 
     } while (node != nullptr);
 
-    if (mn.missingNodes.empty())
+    // An empty result does not mean the map is complete when the walk judged it impossible on the
+    // way down: clearSynching() moves the state to Modifying, which would erase that verdict and
+    // report the map as satisfied. Asking nothing is the only part this has to get right, since
+    // clearSynching() is what a later walk would read.
+    if (mn.missingNodes.empty() && isValid())
         clearSynching();
 
     return std::move(mn.missingNodes);
@@ -605,6 +650,17 @@ SHAMap::addKnownNode(
 
         auto prevNode = inner;
         std::tie(currNode, currNodeID) = descend(inner, currNodeID, branch, filter);
+
+        if (!isValid())
+        {
+            // descend judged a node on the way down and condemned the map. Stops here rather than
+            // falling through, for two reasons: `childHash` was read before that descent, so the
+            // hash comparison below would report a corrupt node against a sender that sent nothing
+            // wrong, and if the node descend refused is the one offered here, that comparison would
+            // instead succeed and hook it after all.
+            JLOG(journal_.warn()) << "Node " << nodeID << " cannot be hooked into an invalid map";
+            return SHAMapAddNode::invalid();
+        }
 
         if (currNode != nullptr)
             continue;
