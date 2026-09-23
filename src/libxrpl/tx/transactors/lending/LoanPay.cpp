@@ -361,6 +361,7 @@ LoanPay::doApply()
     TenthBips32 const coverRateMinimum{brokerSle->at(sfCoverRateMinimum)};
     auto debtTotalProxy = brokerSle->at(sfDebtTotal);
 
+    bool const fixedPrecision = getVaultVersion(vaultSle) == VaultVersion::FixedPrecision;
     auto const vaultScale = getAssetsTotalScale(vaultSle);
 
     // Send the broker fee to the owner if they have sufficient cover available,
@@ -376,8 +377,7 @@ LoanPay::doApply()
         // DebtTotal) use vaultScale. The legacy path below intentionally retains
         // its pre-amendment loanScale behavior.
         auto const minCover = [&]() {
-            if (view.rules().enabled(fixCleanup3_2_0) ||
-                getVaultVersion(vaultSle) == VaultVersion::FixedPrecision)
+            if (view.rules().enabled(fixCleanup3_2_0) || fixedPrecision)
             {
                 return minimumBrokerCover(debtTotalProxy.value(), coverRateMinimum, vaultSle);
             }
@@ -421,6 +421,12 @@ LoanPay::doApply()
         }
     }
 
+    auto const scheduledInterest = [&loanSle] {
+        return loanSle->at(sfTotalValueOutstanding) - loanSle->at(sfPrincipalOutstanding) -
+            loanSle->at(sfManagementFeeOutstanding);
+    };
+    Number const scheduledInterestBefore = fixedPrecision ? scheduledInterest() : kNumZero;
+
     LoanPaymentType const paymentType = [&tx]() {
         // preflight already checked that at most one flag is set.
         if (tx.isFlag(tfLoanLatePayment))
@@ -445,6 +451,10 @@ LoanPay::doApply()
     // If the payment computation completed without error, the loanSle object
     // has been modified.
     view.update(loanSle);
+
+    bool const terminalPayment = loanSle->at(sfPaymentRemaining) == 0;
+    Number const scheduledInterestDelta =
+        fixedPrecision ? scheduledInterest() - scheduledInterestBefore : kNumZero;
 
     XRPL_ASSERT_PARTS(
         // It is possible to pay 0 principal
@@ -472,32 +482,59 @@ LoanPay::doApply()
         // LCOV_EXCL_STOP
     }
 
-    auto const [assetsTotalDelta, debtTotalDelta] = loanPaymentDeltas(vaultSle, *paymentParts);
-
-    JLOG(j_.debug()) << "Loan Pay: principal paid: " << paymentParts->principalPaid
-                     << ", interest paid: " << paymentParts->interestPaid
-                     << ", fee paid: " << paymentParts->feePaid
-                     << ", assets total delta: " << assetsTotalDelta
-                     << ", debt total delta: " << debtTotalDelta;
-
     //------------------------------------------------------
     // LoanBroker object state changes
     view.update(brokerSle);
 
     auto assetsAvailableProxy = vaultSle->at(sfAssetsAvailable);
     auto assetsTotalProxy = vaultSle->at(sfAssetsTotal);
+    Number const assetsAvailableBefore = *assetsAvailableProxy;
+    Number const assetsTotalBefore = *assetsTotalProxy;
 
     auto const totalPaidToVaultRaw = paymentParts->principalPaid + paymentParts->interestPaid;
-    auto const totalPaidToVaultRounded =
-        roundToAsset(asset, totalPaidToVaultRaw, vaultScale, Number::RoundingMode::Downward);
+    int const paymentVaultScale = fixedPrecision
+        ? getPosteriorVaultScale(vaultSle, STAmount{asset, paymentParts->interestPaid})
+        : vaultScale;
+    Number const totalPaidToVaultRounded =
+        roundToAsset(asset, totalPaidToVaultRaw, paymentVaultScale, Number::RoundingMode::Downward);
     XRPL_ASSERT_PARTS(
         !asset.integral() || totalPaidToVaultRaw == totalPaidToVaultRounded,
         "xrpl::LoanPay::doApply",
         "rounding does nothing for integral asset");
-    auto const totalPaidToBroker = paymentParts->feePaid;
+    Number const totalPaidToBrokerRaw = paymentParts->feePaid;
+    Number const totalPaidToBroker = fixedPrecision && !sendBrokerFeeToOwner
+        ? Number{roundToPosteriorBrokerCoverScale(
+              vaultSle,
+              brokerSle,
+              STAmount{asset, totalPaidToBrokerRaw},
+              Number::RoundingMode::TowardsZero)}
+        : totalPaidToBrokerRaw;
+
+    auto const [legacyAssetsTotalDelta, legacyDebtTotalDelta] =
+        loanPaymentDeltas(vaultSle, *paymentParts);
+    Number const fixedAssetsTotalAfter = [&] {
+        if (!fixedPrecision)
+        {
+            return kNumZero;
+        }
+        Number const candidate =
+            assetsTotalBefore + totalPaidToVaultRounded - paymentParts->principalPaid;
+        return roundToAsset(asset, candidate, paymentVaultScale, Number::RoundingMode::TowardsZero);
+    }();
+    Number const assetsTotalDelta =
+        fixedPrecision ? fixedAssetsTotalAfter - assetsTotalBefore : legacyAssetsTotalDelta;
+    Number const debtTotalDelta =
+        fixedPrecision ? paymentParts->principalPaid : legacyDebtTotalDelta;
+
+    JLOG(j_.debug()) << "Loan Pay: principal paid: " << paymentParts->principalPaid
+                     << ", interest paid: " << paymentParts->interestPaid
+                     << ", fee paid: " << paymentParts->feePaid
+                     << ", assets total delta: " << assetsTotalDelta
+                     << ", debt total delta: " << debtTotalDelta
+                     << ", scheduled interest delta: " << scheduledInterestDelta;
 
     XRPL_ASSERT_PARTS(
-        (totalPaidToVaultRaw + totalPaidToBroker) ==
+        (totalPaidToVaultRaw + totalPaidToBrokerRaw) ==
             (paymentParts->principalPaid + paymentParts->interestPaid + paymentParts->feePaid),
         "xrpl::LoanPay::doApply",
         "payments add up");
@@ -512,14 +549,19 @@ LoanPay::doApply()
     // Despite our best efforts, it's possible for rounding errors to accumulate
     // in the loan broker's debt total. This is because the broker may have more
     // than one loan with significantly different scales.
-    adjustImpreciseNumber(debtTotalProxy, -debtTotalDelta, asset, vaultScale);
+    if (fixedPrecision)
+    {
+        debtTotalProxy -= debtTotalDelta;
+    }
+    else
+    {
+        adjustImpreciseNumber(debtTotalProxy, -debtTotalDelta, asset, vaultScale);
+    }
 
     //------------------------------------------------------
     // Vault object state changes
     view.update(vaultSle);
 
-    Number const assetsAvailableBefore = *assetsAvailableProxy;
-    Number const assetsTotalBefore = *assetsTotalProxy;
 #if !NDEBUG
     {
         Number const pseudoAccountBalanceBefore = accountHolds(
@@ -538,7 +580,21 @@ LoanPay::doApply()
 #endif
 
     assetsAvailableProxy += totalPaidToVaultRounded;
-    assetsTotalProxy += assetsTotalDelta;
+    if (fixedPrecision)
+    {
+        assetsTotalProxy = fixedAssetsTotalAfter;
+    }
+    else
+    {
+        assetsTotalProxy += assetsTotalDelta;
+    }
+    if (fixedPrecision)
+    {
+        auto yieldUnrealizedProxy = vaultSle->at(sfYieldUnrealized);
+        yieldUnrealizedProxy += scheduledInterestDelta;
+        if (*yieldUnrealizedProxy < beast::kZero)
+            yieldUnrealizedProxy = kNumZero;
+    }
 
     XRPL_ASSERT_PARTS(
         *assetsAvailableProxy <= *assetsTotalProxy,
@@ -559,9 +615,10 @@ LoanPay::doApply()
     if (!sendBrokerFeeToOwner)
     {
         // If there is not enough first-loss capital, add the fee to First Loss
-        // Cover Pool. Note that this moves the entire fee - it does not attempt
-        // to split it. The broker can Withdraw it later if they want, or leave
-        // it for future needs.
+        // Cover Pool. FixedPrecision rounds the redirected fee at the
+        // posterior cover scale; any sub-unit remainder is forgiven. The
+        // broker can Withdraw the credited amount later or leave it for future
+        // needs.
         coverAvailableProxy += totalPaidToBroker;
     }
 
@@ -577,26 +634,24 @@ LoanPay::doApply()
         assetsAvailableAfter <= assetsTotalAfter,
         "xrpl::LoanPay::doApply",
         "assets available must not be greater than assets outstanding");
-    if (assetsAvailableAfter == assetsAvailableBefore)
+    if (assetsAvailableAfter == assetsAvailableBefore && !(fixedPrecision && terminalPayment))
     {
         // An unchanged assetsAvailable indicates that the amount paid to the
-        // vault was zero, or rounded to zero. That should be impossible, but I
-        // can't rule it out for extreme edge cases, so fail gracefully if it
-        // happens.
-        //
-        // LCOV_EXCL_START
+        // vault was zero, or rounded to zero. FixedPrecision terminal payments
+        // are allowed to close the Loan without moving a sub-live-unit
+        // remainder to the Vault.
         JLOG(j_.warn()) << "LoanPay: Vault assets available unchanged after rounding: "  //
                         << "Before: " << assetsAvailableBefore                           //
                         << ", After: " << assetsAvailableAfter;
         return tecPRECISION_LOSS;
-        // LCOV_EXCL_STOP
     }
-    if (assetsTotalDelta != beast::kZero && assetsTotalAfter == assetsTotalBefore)
+    if (!fixedPrecision && assetsTotalDelta != beast::kZero &&
+        assetsTotalAfter == assetsTotalBefore)
     {
         // Non-zero assetsTotalDelta with an unchanged assetsTotal indicates that
-        // the actual value change rounded to zero. That should be impossible, but
-        // I can't rule it out for extreme edge cases, so fail gracefully if it
-        // happens.
+        // the actual value change rounded to zero. FixedPrecision permits this:
+        // its AssetsTotal delta is rounded vault credit minus base-grid
+        // principal, which can itself be smaller than one live unit.
         //
         // LCOV_EXCL_START
         JLOG(j_.warn())
@@ -826,9 +881,10 @@ LoanPay::doApply()
         goodRounding, "xrpl::LoanPay::doApply", "funds are conserved (with rounding)");
 
     XRPL_ASSERT_PARTS(
-        accountBalanceAfter < accountBalanceBefore || accountID_ == asset.getIssuer(),
+        totalPaidToVaultRounded + totalPaidToBroker == beast::kZero ||
+            accountBalanceAfter < accountBalanceBefore || accountID_ == asset.getIssuer(),
         "xrpl::LoanPay::doApply",
-        "account balance decreased");
+        "account balance decreased unless the payment rounded to zero");
     XRPL_ASSERT_PARTS(
         vaultBalanceAfter >= beast::kZero && brokerBalanceAfter >= beast::kZero,
         "xrpl::LoanPay::doApply",
@@ -842,9 +898,10 @@ LoanPay::doApply()
         "xrpl::LoanPay::doApply",
         "broker balance did not decrease");
     XRPL_ASSERT_PARTS(
-        vaultBalanceAfter > vaultBalanceBefore || brokerBalanceAfter > brokerBalanceBefore,
+        totalPaidToVaultRounded + totalPaidToBroker == beast::kZero ||
+            vaultBalanceAfter > vaultBalanceBefore || brokerBalanceAfter > brokerBalanceBefore,
         "xrpl::LoanPay::doApply",
-        "vault and/or broker balance increased");
+        "vault and/or broker balance increased unless the payment rounded to zero");
 
     return tesSUCCESS;
 }
