@@ -1,0 +1,337 @@
+# Manually-triggered workflow that builds the Windows `xrpld.exe` binary for a
+# chosen tag/branch/commit, bundles it with the example config and validators
+# files, uploads it as a downloadable workflow artifact, and (optionally)
+# publishes it to a GitHub Release so it can be downloaded directly.
+#
+# Unlike `on-trigger.yml`, this runs on a GitHub-hosted Windows runner (no
+# self-hosted "dev-box-windows-2026" required) and is completely self-contained:
+# it installs Conan + Python itself and uses the Visual Studio toolchain that is
+# preinstalled on the chosen runner image.
+name: Manual Windows Build
+
+on:
+  # Only ever runs when you start it by hand from the Actions tab (or via API).
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag, branch, or commit SHA to build (e.g. '3.3.0'). Leave empty to build this workflow's own ref."
+        required: false
+        type: string
+        default: ""
+
+      build_type:
+        description: "Build configuration."
+        required: true
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: Release
+
+      include_tests:
+        description: "Include the unit tests in the binary (bigger exe, adds `xrpld --unittest`). Off = lean production binary."
+        required: true
+        type: boolean
+        default: false
+
+      release_tag:
+        description: "Name for the GitHub Release / tag. Leave empty to reuse the build ref above (Option A). Set it to name the release independently of what you build (Option B)."
+        required: false
+        type: string
+        default: ""
+
+      publish_release:
+        description: "Also publish the binary to a GitHub Release for the tag."
+        required: true
+        type: boolean
+        default: true
+
+      runs_on:
+        description: "Runner image to build on. Pin an older one if a newer MSVC breaks a dependency; bump it when older images are retired."
+        required: true
+        type: choice
+        options:
+          # Since the 2026-06-08..15 image migration these labels all serve
+          # Windows Server 2025 + Visual Studio 2026 18.x (MSVC 19.5x / v145,
+          # CMake 4.2.3) and NO LONGER contain VS 2022. This is the toolchain
+          # XRPLF tests 3.3.0 on (their self-hosted "dev-box-windows-2026"
+          # runner, see .github/scripts/strategy-matrix/windows.json), so the
+          # prebuilt Conan binaries on conan.xrplf.org can actually be reused.
+          - windows-2025
+          - windows-2025-vs2026 # Explicit VS 2026 label (same image as windows-2025 now).
+          - windows-latest # Whatever GitHub currently maps "latest" to (VS 2026).
+          # VS 2022 17.x — MSVC 19.4x (v143). What rippled 3.2.0 was built with
+          # here; still supported under GitHub's two-LTS-versions policy. Not
+          # covered by XRPLF's CI for 3.3.0, and every dependency will be
+          # compiled from source (no matching prebuilt binaries on the remote).
+          - windows-2022
+        default: windows-2025
+
+      conan_remote_url:
+        description: "Conan remote that hosts XRPLF's patched dependency recipes. This has changed across versions, so pick the one matching the ref you build."
+        required: true
+        type: choice
+        options:
+          - https://conan.xrplf.org/repository/conan/ # Used by 3.3.0 and newer (see .github/actions/setup-conan).
+          - https://conan.ripplex.io # Legacy remote used by 3.2.0 and earlier tooling.
+        default: https://conan.xrplf.org/repository/conan/
+
+# Needed so the workflow can create/update a GitHub Release.
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  BUILD_DIR: build
+
+jobs:
+  build-windows:
+    name: Build xrpld.exe (${{ inputs.build_type }})
+    # Defaults to windows-2025, which since June 2026 is Windows Server 2025 +
+    # Visual Studio 2026 (MSVC 19.5x / v145) — the same toolchain XRPLF builds
+    # 3.3.0 with on their self-hosted runner, so the pinned dependency set
+    # (gRPC 1.81.1, Boost 1.91.0, protobuf 6.33.5) is known to compile and
+    # prebuilt binaries may be reusable. Fall back to windows-2022 (VS 2022)
+    # via the 'runs_on' input if VS 2026 trips over something.
+    runs-on: ${{ inputs.runs_on }}
+    # A cold build (all Conan dependencies compiled from source) can take a
+    # while on a hosted runner, so give it plenty of headroom.
+    timeout-minutes: 300
+
+    steps:
+      # Resolve which ref to build: the manual input if given, otherwise the
+      # ref this workflow was launched on.
+      - name: Determine ref to build
+        id: ref
+        run: |
+          REF='${{ inputs.ref }}'
+          if [ -z "${REF}" ]; then
+              REF='${{ github.ref_name }}'
+          fi
+          echo "value=${REF}" >>"${GITHUB_OUTPUT}"
+          echo "Building ref: ${REF}"
+
+          # Release tag: explicit input if given (Option B), otherwise reuse the
+          # build ref (Option A).
+          RELEASE_TAG='${{ inputs.release_tag }}'
+          if [ -z "${RELEASE_TAG}" ]; then
+              RELEASE_TAG="${REF}"
+          fi
+          # Always mark the release as a Windows build (avoids clashing with the
+          # upstream source tag/release of the same name).
+          case "${RELEASE_TAG}" in
+              *windows*) ;;
+              *) RELEASE_TAG="${RELEASE_TAG}-windows" ;;
+          esac
+          echo "release_tag=${RELEASE_TAG}" >>"${GITHUB_OUTPUT}"
+          echo "Release tag: ${RELEASE_TAG}"
+
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.ref.outputs.value }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+
+      # Ninja is not preinstalled on the Windows runner images; the PyPI wheel
+      # is the quickest way to get it and lands in the same Scripts directory
+      # that setup-python already put on PATH.
+      - name: Install Conan and Ninja
+        run: |
+          pip install --upgrade "conan~=2.0" ninja
+          conan --version
+          ninja --version
+
+      # Mirror the repo's `setup-conan` action: install the global config, the
+      # profiles (`default`, `ci`, `sanitizers` — `ci` includes `sanitizers`,
+      # which in turn includes `default`), and add the XRPLF Conan remote so
+      # prebuilt dependency binaries can be reused where they match.
+      - name: Set up Conan configuration
+        run: |
+          cat conan/global.conf >"$(conan config home)/global.conf"
+          conan config install conan/profiles/ -tf "$(conan config home)/profiles/"
+          conan config show '*'
+          conan profile show --profile ci
+
+      - name: Add Conan remote
+        env:
+          REMOTE_URL: ${{ inputs.conan_remote_url }}
+        run: |
+          conan remote add --index 0 --force xrplf "${REMOTE_URL}"
+          conan remote list
+
+      # Cache the Conan package store (compiled dependency binaries). The key is
+      # keyed on the locked dependency versions + build type, so it only misses
+      # when dependencies actually change. This turns the slow "compile every
+      # dependency from source" first run into a fast download on later runs.
+      - name: Cache Conan dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.conan2/p
+          key: conan-${{ inputs.runs_on }}-${{ inputs.build_type }}-tests_${{ inputs.include_tests }}-${{ hashFiles('conan.lock', 'conanfile.py') }}
+          restore-keys: |
+            conan-${{ inputs.runs_on }}-${{ inputs.build_type }}-tests_${{ inputs.include_tests }}-
+            conan-${{ inputs.runs_on }}-${{ inputs.build_type }}-
+            conan-${{ inputs.runs_on }}-
+
+      - name: Get number of processors
+        id: nproc
+        run: echo "value=$(nproc 2>/dev/null || echo "${NUMBER_OF_PROCESSORS:-4}")" >>"${GITHUB_OUTPUT}"
+
+      # Build/download the C++ dependencies. `--build=missing` compiles anything
+      # not available as a prebuilt binary on the remote for this toolchain.
+      # `conan.lock` in the repo root is picked up implicitly and pins the exact
+      # dependency revisions (see conan/lockfile/README.md).
+      - name: Install dependencies (Conan)
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+          BUILD_NPROC: ${{ steps.nproc.outputs.value }}
+        run: |
+          conan install \
+              --profile:all ci \
+              --build=missing \
+              --conf:all tools.cmake.cmaketoolchain:generator=Ninja \
+              --options:host='&:xrpld=True' \
+              --options:host='&:tests=${{ inputs.include_tests && 'True' || 'False' }}' \
+              --settings:all build_type="${BUILD_TYPE}" \
+              --conf:all tools.build:jobs="${BUILD_NPROC}" \
+              --conf:all tools.build:verbosity=quiet \
+              --conf:all tools.compilation:verbosity=quiet \
+              .
+
+      # Ninja calls cl.exe directly, so unlike the Visual Studio generator it
+      # needs the MSVC developer environment (INCLUDE/LIB/PATH) to be active.
+      # Conan emits `conanvcvars.bat` for exactly this when the CMake generator
+      # is not a Visual Studio one; fall back to the VS-provided vcvars64.bat if
+      # it is missing for any reason.
+      - name: Locate MSVC developer environment
+        id: vcvars
+        run: |
+          set -e
+          CONANVCVARS="$(pwd)/${BUILD_DIR}/generators/conanvcvars.bat"
+          if [ -f "${CONANVCVARS}" ]; then
+              echo "Using Conan-generated conanvcvars.bat"
+              echo "path=$(cygpath -w "${CONANVCVARS}")" >>"${GITHUB_OUTPUT}"
+          else
+              VSWHERE='/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe'
+              VSROOT=$(cygpath -u "$("${VSWHERE}" -latest -products '*' -property installationPath | tr -d '\r')")
+              VC="${VSROOT}/VC/Auxiliary/Build/vcvars64.bat"
+              if [ ! -f "${VC}" ]; then
+                  echo "Neither conanvcvars.bat nor vcvars64.bat found" >&2
+                  exit 1
+              fi
+              echo "conanvcvars.bat absent; falling back to vcvars64.bat"
+              echo "path=$(cygpath -w "${VC}")" >>"${GITHUB_OUTPUT}"
+          fi
+
+      # Ninja instead of the Visual Studio generator: MSBuild launches cl.exe in
+      # a way that makes it die at load time with 0xC0000139 on the VS 2026
+      # runner images, for every installed toolset, both compiler hosts, with
+      # and without file tracking. The exact same cl.exe, given rippled's exact
+      # flag set, compiles fine when invoked directly — which is precisely what
+      # Ninja does. Ninja is also single-config, hence no --config below and the
+      # binary landing in build/ rather than build/<Config>/.
+      - name: Configure CMake
+        working-directory: ${{ env.BUILD_DIR }}
+        shell: cmd
+        run: |
+          call "${{ steps.vcvars.outputs.path }}" || exit /b 1
+          cmake --version
+          ninja --version
+          cmake -G Ninja ^
+              -DCMAKE_TOOLCHAIN_FILE:FILEPATH=build/generators/conan_toolchain.cmake ^
+              -DCMAKE_BUILD_TYPE=${{ inputs.build_type }} ^
+              -Dxrpld=ON ^
+              -Dtests=${{ inputs.include_tests && 'ON' || 'OFF' }} ^
+              .. || exit /b 1
+
+      - name: Build xrpld
+        working-directory: ${{ env.BUILD_DIR }}
+        shell: cmd
+        run: |
+          call "${{ steps.vcvars.outputs.path }}" || exit /b 1
+          cmake --build . --parallel ${{ steps.nproc.outputs.value }} --target xrpld || exit /b 1
+
+      # Gather the binary together with the example config and validators list
+      # into a single folder. The files are kept individual (no zip) so they can
+      # be attached to the release one by one.
+      - name: Gather binary + config files
+        id: package
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+          REF: ${{ steps.ref.outputs.value }}
+        run: |
+          set -e
+          # Make a filesystem-safe slug out of the ref (e.g. refs with '/').
+          SLUG=$(echo "${REF}" | tr '/' '-')
+          PKG="xrpld-windows-${SLUG}-${BUILD_TYPE}"
+          mkdir -p "${PKG}"
+
+          # Ninja (single-config) writes to build/xrpld.exe; the Visual Studio
+          # generator used to write to build/<Config>/xrpld.exe. Search both so
+          # the packaging step does not depend on the generator.
+          EXE=$(find "${BUILD_DIR}" -maxdepth 2 -name xrpld.exe -type f | head -1)
+          if [ -z "${EXE}" ]; then
+              echo "xrpld.exe not found under ${BUILD_DIR}" >&2
+              exit 1
+          fi
+          echo "Found binary: ${EXE}"
+          cp "${EXE}" "${PKG}/"
+          cp cfg/xrpld-example.cfg "${PKG}/xrpld.cfg"
+          cp cfg/validators-example.txt "${PKG}/validators.txt"
+
+          # Sanity check + record the version for the release notes. `--version`
+          # prints several lines (version, commit hash, branch); keep only the
+          # first, since a multi-line value is invalid in GITHUB_OUTPUT.
+          VERSION=$("${PKG}/xrpld.exe" --version || echo "unknown")
+          VERSION=$(printf '%s\n' "${VERSION}" | head -n 1)
+          echo "${VERSION}"
+
+          echo "pkg_dir=${PKG}" >>"${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >>"${GITHUB_OUTPUT}"
+          # The actual commit that was checked out and built, so the release tag
+          # points at the built code rather than the workflow's own ref.
+          echo "sha=$(git rev-parse HEAD)" >>"${GITHUB_OUTPUT}"
+
+      # Downloadable from the workflow run's "Artifacts" section.
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.package.outputs.pkg_dir }}
+          path: ${{ steps.package.outputs.pkg_dir }}/
+          retention-days: 14
+          if-no-files-found: error
+
+      # Create (or reuse) a GitHub Release for the built ref and attach the
+      # individual files (xrpld.exe, xrpld.cfg, validators.txt) as separate
+      # assets. `--clobber` lets you re-run the build and replace existing assets.
+      - name: Publish to GitHub Release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ref.outputs.release_tag }}
+          PKG: ${{ steps.package.outputs.pkg_dir }}
+          VERSION: ${{ steps.package.outputs.version }}
+          TARGET_SHA: ${{ steps.package.outputs.sha }}
+        run: |
+          set -e
+          if ! gh release view "${TAG}" >/dev/null 2>&1; then
+              echo "Creating release ${TAG}"
+              gh release create "${TAG}" \
+                  --title "${TAG}" \
+                  --notes "Windows ${{ inputs.build_type }} build of xrpld. ${VERSION}" \
+                  --target "${TARGET_SHA}"
+          else
+              echo "Release ${TAG} already exists; uploading assets to it."
+          fi
+          gh release upload "${TAG}" \
+              "${PKG}/xrpld.exe" \
+              "${PKG}/xrpld.cfg" \
+              "${PKG}/validators.txt" \
+              --clobber
